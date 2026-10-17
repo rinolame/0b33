@@ -461,6 +461,16 @@ fn validate_utf8_string(s: &String, _field_name: &str) -> Result<(), Error> {
     s.copy_into_slice(&mut raw);
     let text = core::str::from_utf8(&raw).map_err(|_| Error::InvalidInput)?;
 
+    // Reject null bytes (issue #300). `\0` is valid UTF-8 but terminates
+    // C-style strings in downstream systems, silently truncating values.
+    // The allowed character set is: any valid UTF-8 sequence that contains
+    // no NUL byte, no control characters other than tab (0x09), newline
+    // (0x0A), and carriage return (0x0D), and at least one printable
+    // (>= 0x20) non-whitespace character.
+    if text.bytes().any(|byte| byte == 0) {
+        return Err(Error::InvalidInput);
+    }
+
     // Reject control characters (except tab/newline/CR) and require at least
     // one printable, non-whitespace character.
     let mut has_non_control_char = false;
@@ -517,6 +527,20 @@ mod utf8_validation_tests {
         let env = Env::default();
         let spaces = String::from_str(&env, "   ");
         assert!(validate_utf8_string(&spaces, "metadata value").is_err());
+    }
+
+    #[test]
+    fn rejects_null_bytes_in_values() {
+        let env = Env::default();
+        let value = String::from_str(&env, "abc\0def");
+        assert!(validate_utf8_string(&value, "metadata value").is_err());
+    }
+
+    #[test]
+    fn rejects_null_bytes_in_keys() {
+        let env = Env::default();
+        let key = String::from_str(&env, "key\0name");
+        assert!(validate_utf8_string(&key, "metadata key").is_err());
     }
 }
 
