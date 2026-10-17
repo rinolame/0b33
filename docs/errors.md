@@ -41,7 +41,7 @@
 | 4002 | `NotActive` | State transition | Operation requires an active subscription state. | Refresh state; do not blindly retry. |
 | 4003 | `SubscriptionExpired` | State transition | Subscription has expired. | Stop retrying mutating operations on this subscription. |
 | 4004 | `IntervalNotElapsed` | State transition | Interval charge attempted too early. | Safe to retry after the next eligible timestamp only. |
-| 4005 | `Replay` | State transition | Duplicate charge/recovery/reference was detected. | Treat as idempotent duplicate. Do not retry with a new key for the same action. |
+| 4005 | `Replay` | State transition | A period, recovery, or reference replay guard rejected the operation. | Reconcile contract state and the local request record; do not treat the error alone as proof of success. |
 | 4006 | `RecoveryNotAllowed` | State transition | Recovery flow is not allowed in the current context. | Stop and inspect state/policy. |
 | 4007 | `EmergencyStopActive` | State transition | Emergency stop blocks critical mutations. | Pause writes until admin clears emergency stop. |
 | 4008 | `AlreadyInitialized` | State transition | Contract init was called more than once. | Do not retry. |
@@ -86,118 +86,24 @@
 
 ## Handling `Error::Replay` (4005) in Production Clients
 
-`Error::Replay` is returned when the contract detects a duplicate charge, recovery, or reference. It is **not** a generic failure and must not be treated as a retryable transient error. In production clients the correct behavior depends on *why* the duplicate was detected:
+`Error::Replay` is not the response used for a duplicate optional idempotency key. For `charge_subscription`, `deposit_funds`, and `charge_one_off`, resubmitting the same request with the same key during the retention window returns the entrypoint's normal success result without executing the operation again, provided the request passes the entrypoint's authorization and state checks before the idempotency lookup. This supports at-least-once delivery when the original response is lost and the request remains eligible for processing.
 
-| Scenario | What happened | Correct client behavior |
-|---|---|---|
-| Already succeeded | The charge (identified by the same idempotency key) already committed successfully. | Safe to ignore. Record the charge as successful and do not create a new key. |
-| Duplicate key collision | The client reused an idempotency key for a different logical action (different amount, subscription, or operation). | Client bug. Do not retry. Alert and fix key generation. |
+An idempotency key is scoped to its operation and subscription, but the contract does not compare the request payload with the payload originally submitted under that key. Reusing a key for a different amount or logical action silently produces the duplicate no-op. Derive and persist a unique key for each logical action, bind it to the request fingerprint off-chain, and retry only the exact same request with that key. The key must still be retained: entries expire after the configured TTL (seven days by default) and the per-subscription history is bounded to 64 entries.
 
-The contract cannot always tell these apart from the error alone, so the client must use its own record of the idempotency key and the original request parameters.
+`Error::Replay` (4005) instead reports a replay guard such as an already-charged billing period or a reused recovery/reference. It does not return the prior operation's result and, on its own, does not prove that this particular request succeeded. Do not treat every `Replay` as success or retry with a fresh key. Reconcile the subscription/period state and the durable local job record; mark the job complete only when they establish that the intended logical action was already applied. Otherwise surface the conflict for investigation.
 
-### Recommended client algorithm
+### Recommended at-least-once algorithm
 
-1. Before sending a charge, derive a deterministic idempotency key from `tx_hash` and the logical action (e.g. `subscription_id`, amount, period).
-2. Persist the key and the request fingerprint before submitting.
-3. On `Error::Replay` (4005):
-   - If the key matches a previously committed charge for the same fingerprint, treat it as success (idmpotent no-op).
-   - If the key matches a different fingerprint, raise a client-bug alert and do not retry.
-4. Never generate a fresh key for the same logical action in response to `Replay`.
-
-### Example: TypeScript
-
-```ts
-import { Error } from "./generated/subscription_vault";
-
-interface ChargeRequest {
-  subscriptionId: bigint;
-  amount: bigint;
-  period: number;
-}
-
-interface CommittedCharge {
-  key: string;
-  fingerprint: string;
-}
-
-const committedCharges = new Map<string, CommittedCharge>();
-
-function fingerprint(req: ChargeRequest): string {
-  return `${req.subscriptionId}:${req.amount}:${req.period}`;
-}
-
-async function charge(req: ChargeRequest, key: string): Promise<void> {
-  const fp = fingerprint(req);
-  try {
-    await contract.charge(req.subscriptionId, req.amount, req.period, key);
-    committedCharges.set(key, { key, fingerprint: fp });
-  } catch (err) {
-    if (err === Error.Replay) {
-      const prior = committedCharges.get(key);
-      if (prior && prior.fingerprint === fp) {
-        // Already succeeded: safe to ignore.
-        return;
-      }
-      // Duplicate key collision: client bug.
-      throw new Error(
-        `Replay for key ${key} but fingerprint mismatch (prior=${prior.fingerprint}, new=${fp})`,
-      );
-    }
-    throw err;
-  }
-}
-```
-
-### Example: Rust
-
-```rust
-use std::collections::HashMap;
-
-use subscription_vault::Error;
-
-#[derive(Clone, Eq::PartialEq, Hash)]
-struct ChargeRequest {
-    subscription_id: u64,
-    amount: i128,
-    period: u32,
-}
-
-fn fingerprint(req: &ChargeRequest) -> String {
-    format!("{}:{}:{}", req.subscription_id, req.amount, req.period)
-}
-
-async fn charge(
-    req: ChargeRequest,
-    key: &str,
-    committed: &mut HashMap<String, String>,
-) > Result<void, Error> {
-    match contract.charge(req.subscription_id, req.amount, req.period, key) {
-        Ok() => {
-            committed.insert(key.to_string(), fingerprint(&req));
-            Ok(()
-        }
-        Err(Error::Replay) => {
-            match committed.get(key) {
-                // Already succeeded: safe to ignore.
-                Some(prior) if prior == &fingerprint(&req) => Ok(),
-                // Duplicate key collision: client bug.
-                Some(prior) => panic!(
-                    "Replay for key {key} but fingerprint mismatch (prior={prior}, new={})",
-                    fingerprint(&req)
-                ),
-                None => panic!("Replay for key {key} without a prior committed charge"),
-            }
-        }
-        Err(e) => Err(e),
-    }
-}
-```
+1. Derive a stable key from the logical action, including the operation, subscription, and billing period or request identifier.
+2. Persist the key and request fingerprint before submitting.
+3. If the response is lost or the submission outcome is unknown, resubmit the exact same request with the same key. A recognized key returns normal success without applying the operation again.
+4. If the call returns `Error::Replay`, reconcile state and the local record as described above. Never create a fresh key just to bypass the replay guard.
 
 ## Retry Guidance
 
 - Safe to retry later: `IntervalNotElapsed`, `EmergencyStopActive`, `OraclePriceStale`, `OraclePriceUnavailable`, `RateLimitExceeded`, `BurstLimitExceeded`, `InsufficientBalance`, `InsufficientPrepaidBalance`.
 - Safe only after request changes: `Unauthorized`, `Forbidden`, `InvalidAmount`, `InvalidInput`, `InvalidExportLimit`, `UsageNotEnabled`, `CreditLimitExceeded`, `MaxConcurrentSubscriptionsReached`, `MerchantTagLimitExceeded`, `UnknownMerchantTag`, `DuplicateMerchantTag`.
-- Treat as idempotent duplicate, not a fresh retry: `Replay`.
+- Treat `Replay` as a state conflict requiring reconciliation, not as the success response for an optional idempotency-key retry.
 - Treat as terminal and operator-visible: `Overflow`, `Underflow`, `Reentrancy`, `SubscriptionLimitReached`, `LifetimeCapReached`.
 
 ## Security Notes

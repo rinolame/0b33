@@ -674,7 +674,8 @@ pub use blocklist::{BlocklistAddedEvent, BlocklistEntry, BlocklistRemovedEvent};
 pub use queries::{
     compute_next_charge_info, generate_reconciliation_proof, get_contract_reconciliation_summary,
     get_token_reconciliation, query_prepaid_balances_paginated, MAX_PREPAID_SCAN_DEPTH,
-    MAX_SCAN_DEPTH, MAX_SUBSCRIPTION_LIST_PAGE, MAX_TOKEN_SUMMARIES_PER_PAGE,
+    MAX_MERCHANT_CURSOR_DEPTH, MAX_SCAN_DEPTH, MAX_SUBSCRIPTION_LIST_PAGE,
+    MAX_TOKEN_SUMMARIES_PER_PAGE,
 };
 pub use state_machine::{can_transition, get_allowed_transitions, validate_status_transition};
 pub use types::{
@@ -698,7 +699,7 @@ pub use types::{
     PlanDeprecatedEvent, PlanRegisteredEvent, PlanTemplate, PlanTemplateUpdatedEvent,
     PrepaidQueryRequest, PrepaidQueryResult, ProtocolFeeChargedEvent, RateLimitTrippedEvent,
     ReconciliationProof, ReconciliationSummaryPage, RecoveryEvent, RecoveryInitiatorRole,
-    RecoveryReason,
+    RecoveryReason, RecoveryResult,
     ReferralAttributedEvent, ScheduledPayoutEvent, SchemaMigratedEvent, SignedMetadataPayload,
     SchemaMigrationSummary,
     SnapshotExportedEvent, SnapshotRestoredEvent, SplitChargeEvent, SplitPayees,
@@ -981,7 +982,12 @@ impl SubscriptionVault {
         )
     }
 
-    /// Allows the admin to recover funds that are not tied to any subscription.
+    /// Allows the admin to recover unaccounted funds.
+    ///
+    /// The transfer is capped at the token's actual recoverable balance, so
+    /// subscriber prepaid funds and other accounted liabilities remain intact.
+    /// The result reports both the amount transferred and any amount trimmed
+    /// from the request.
     pub fn recover_stranded_funds(
         env: Env,
         admin: Address,
@@ -990,7 +996,7 @@ impl SubscriptionVault {
         amount: i128,
         recovery_id: String,
         reason: RecoveryReason,
-    ) -> Result<(), Error> {
+    ) -> Result<RecoveryResult, Error> {
         admin::do_recover_stranded_funds(&env, admin, token, recipient, amount, recovery_id, reason)
     }
 
@@ -1337,11 +1343,7 @@ impl SubscriptionVault {
         let mut out = Vec::new(&env);
         let mut id = start_id;
         while id < end_id {
-            if let Some(sub) = env
-                .storage()
-                .persistent()
-                .get::<_, Subscription>(&DataKey::Sub(id))
-            {
+            if let Some(sub) = subscription::read_subscription(&env, id) {
                 out.push_back(SubscriptionSummary {
                     subscription_id: id,
                     subscriber: sub.subscriber,
@@ -1405,11 +1407,7 @@ impl SubscriptionVault {
         let mut balances = Vec::new(&env);
         let mut id = start_id;
         while id < end_id {
-            if let Some(sub) = env
-                .storage()
-                .persistent()
-                .get::<_, Subscription>(&DataKey::Sub(id))
-            {
+            if let Some(sub) = subscription::read_subscription(&env, id) {
                 subs.push_back(SubscriptionSummary {
                     subscription_id: id,
                     subscriber: sub.subscriber.clone(),
@@ -3173,7 +3171,9 @@ impl SubscriptionVault {
     /// (`None` requests the first page). Pass `reverse = true` to page through
     /// the merchant's subscriptions in reverse-chronological (newest-first)
     /// order. Cursors are direction-specific, so replay one with the same
-    /// `reverse` value that produced it.
+    /// `reverse` value that produced it. Traversal stops after
+    /// `MAX_MERCHANT_CURSOR_DEPTH` index entries and returns an empty terminal
+    /// page for cursors at or beyond that depth.
     pub fn list_subscriptions_by_merchant(
         env: Env,
         merchant: Address,

@@ -73,8 +73,12 @@ pub fn list_subscriptions_by_merchant(
 
 **Returns:** `SubscriptionsMerchantPage { subscriptions, next_cursor, total }`.
 `next_cursor` is `Some(offset)` while more results remain and `None` once the
-enumeration is complete. `total` is the merchant's full index length and is the
-same in both directions.
+enumeration is complete or the cursor-depth limit is reached. Traversal is
+capped at `MAX_MERCHANT_CURSOR_DEPTH` (1,000) index entries across all pages. A
+page that reaches the cap has no `next_cursor`; a request at or beyond the cap
+returns an empty terminal page (a tombstone). `total` is the merchant's full
+index length and is the same in both directions, so it may exceed the capped
+number of entries available through this cursor endpoint.
 
 **Cursors are direction-specific.** A cursor is an offset into the ordering
 selected by `reverse`, so page with the same `reverse` value that produced the

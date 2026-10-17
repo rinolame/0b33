@@ -121,7 +121,7 @@
 //! - `DataKey::NextId`
 
 use crate::safe_math::{safe_mul, safe_sub};
-use crate::subscription::extend_subscription_ttl;
+use crate::subscription::read_subscription;
 use crate::types::{
     CapInfo, DataKey, Error, NextChargeInfo, Subscription, SubscriptionStatus,
     SubscriptionsMerchantPage,
@@ -131,6 +131,13 @@ use soroban_sdk::{contracttype, Address, Env, Vec};
 /// Maximum `limit` for [`get_subscriptions_by_merchant`] and [`get_subscriptions_by_token`]
 /// (aligned with [`list_subscriptions_by_subscriber`]).
 pub const MAX_SUBSCRIPTION_LIST_PAGE: u32 = 100;
+
+/// Maximum offset that [`get_subscriptions_by_merchant_paginated`] will serve.
+///
+/// This bounds total enumeration across chained pages, not just the work in a
+/// single call. Once the cursor reaches this depth, the query returns an empty
+/// terminal page.
+pub const MAX_MERCHANT_CURSOR_DEPTH: u32 = 1_000;
 
 /// Hard upper bound on the `limit` parameter for [`list_subscriptions_by_subscriber`].
 ///
@@ -159,13 +166,7 @@ pub const MAX_QUERY_RESULTS: u32 = 100;
 pub const MAX_SCAN_DEPTH: u32 = 1_000;
 
 pub fn get_subscription(env: &Env, subscription_id: u32) -> Result<Subscription, Error> {
-    let key = DataKey::Sub(subscription_id);
-    let mut sub: Subscription = env
-        .storage()
-        .persistent()
-        .get(&key)
-        .ok_or(Error::NotFound)?;
-    extend_subscription_ttl(env, &key);
+    let mut sub = read_subscription(env, subscription_id).ok_or(Error::NotFound)?;
 
     // `GracePeriod` is persisted, but the transition out of it only happens on
     // the next charge attempt. If the grace window has already elapsed with no
@@ -233,11 +234,7 @@ fn read_merchant_page(
             position
         };
         if let Some(sub_id) = ids.get(index) {
-            if let Some(sub) = env
-                .storage()
-                .persistent()
-                .get::<_, Subscription>(&DataKey::Sub(sub_id))
-            {
+            if let Some(sub) = read_subscription(env, sub_id) {
                 out.push_back(sub);
             }
         }
@@ -298,6 +295,10 @@ pub fn get_merchant_subscription_count(env: &Env, merchant: Address) -> u32 {
 /// - `next_cursor`: Offset to use for the next page (if more results exist)
 /// - `total`: Total number of subscriptions for this merchant
 ///
+/// Cursor traversal is capped at [`MAX_MERCHANT_CURSOR_DEPTH`] index entries.
+/// The page is truncated at that boundary, and requests at or beyond it return
+/// an empty terminal page (a tombstone) with `next_cursor == None`.
+///
 /// # Errors
 /// - `InvalidInput` if limit is 0 or exceeds `MAX_SUBSCRIPTION_LIST_PAGE`
 ///
@@ -328,7 +329,7 @@ pub fn get_subscriptions_by_merchant_paginated(
     let total = ids.len();
 
     let start = cursor.unwrap_or(0);
-    if start >= total {
+    if start >= total || start >= MAX_MERCHANT_CURSOR_DEPTH {
         return Ok(SubscriptionsMerchantPage {
             subscriptions: Vec::new(env),
             next_cursor: None,
@@ -336,10 +337,17 @@ pub fn get_subscriptions_by_merchant_paginated(
         });
     }
 
-    let end = start.saturating_add(limit).min(total);
-    let subscriptions = read_merchant_page(env, &ids, start, limit, reverse);
+    let end = start
+        .saturating_add(limit)
+        .min(total)
+        .min(MAX_MERCHANT_CURSOR_DEPTH);
+    let subscriptions = read_merchant_page(env, &ids, start, end - start, reverse);
 
-    let next_cursor = if end < total { Some(end) } else { None };
+    let next_cursor = if end < total && end < MAX_MERCHANT_CURSOR_DEPTH {
+        Some(end)
+    } else {
+        None
+    };
 
     Ok(SubscriptionsMerchantPage {
         subscriptions,
@@ -380,11 +388,7 @@ pub fn get_subscriptions_by_token(
     };
     let mut out = Vec::new(env);
     for id in ids.iter().skip(start as usize).take((end - start) as usize) {
-        if let Some(sub) = env
-            .storage()
-            .persistent()
-            .get::<_, Subscription>(&DataKey::Sub(id))
-        {
+        if let Some(sub) = read_subscription(env, id) {
             out.push_back(sub);
         }
     }
@@ -666,11 +670,7 @@ pub fn list_recoverable_subscriptions(
         }
         scanned += 1;
 
-        if let Some(sub) = env
-            .storage()
-            .persistent()
-            .get::<_, Subscription>(&DataKey::Sub(cursor_id))
-        {
+        if let Some(sub) = read_subscription(env, cursor_id) {
             if sub.status == SubscriptionStatus::Cancelled && sub.prepaid_balance > 0 {
                 if subscriptions.len() < limit {
                     subscriptions.push_back(RecoverableSubscription {
@@ -940,11 +940,7 @@ pub fn query_prepaid_balances_paginated(
     let mut subscriptions_count: u32 = 0;
 
     for id in request.start_subscription_id..scan_end {
-        if let Some(sub) = env
-            .storage()
-            .persistent()
-            .get::<_, Subscription>(&DataKey::Sub(id))
-        {
+        if let Some(sub) = read_subscription(env, id) {
             if sub.token == request.token && sub.prepaid_balance > 0 {
                 partial_total = partial_total.saturating_add(sub.prepaid_balance);
                 subscriptions_count = subscriptions_count.saturating_add(1);
@@ -971,11 +967,7 @@ fn compute_total_prepaid(env: &Env, token: &Address) -> i128 {
 
     let mut total: i128 = 0;
     for id in 0..next_id {
-        if let Some(sub) = env
-            .storage()
-            .persistent()
-            .get::<_, Subscription>(&DataKey::Sub(id))
-        {
+        if let Some(sub) = read_subscription(env, id) {
             if sub.token == *token {
                 total = total.saturating_add(sub.prepaid_balance);
             }
@@ -990,11 +982,7 @@ fn compute_total_prepaid_with_count(env: &Env, token: &Address) -> (i128, u32) {
     let mut total: i128 = 0;
     let mut count: u32 = 0;
     for id in 0..next_id {
-        if let Some(sub) = env
-            .storage()
-            .persistent()
-            .get::<_, Subscription>(&DataKey::Sub(id))
-        {
+        if let Some(sub) = read_subscription(env, id) {
             if sub.token == *token && sub.prepaid_balance > 0 {
                 total = total.saturating_add(sub.prepaid_balance);
                 count = count.saturating_add(1);
