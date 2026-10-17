@@ -154,6 +154,14 @@ pub mod statements {
             .unwrap_or(Vec::new(env));
         ids.push_back(next_seq);
         env.storage().persistent().set(&idx_key, &ids);
+        // Keep the secondary index alive for at least as long as the primary
+        // statement record. Otherwise a live subscription can lose its list
+        // of statements while the immutable records still exist.
+        env.storage().persistent().extend_ttl(
+            &idx_key,
+            crate::types::BILLING_STATEMENT_TTL_THRESHOLD,
+            crate::types::BILLING_STATEMENT_TTL_EXTEND_TO,
+        );
 
         Ok(())
     }
@@ -802,6 +810,21 @@ impl SubscriptionVault {
     /// Get the current grace-period duration in seconds.
     pub fn get_grace_period(env: Env) -> Result<u64, Error> {
         admin::get_grace_period(&env)
+    }
+
+    /// Configure the persistent subscription TTL policy. Admin only.
+    pub fn set_subscription_ttl_config(
+        env: Env,
+        admin: Address,
+        threshold: u32,
+        extend_to: u32,
+    ) -> Result<(), Error> {
+        subscription::set_ttl_config(&env, admin, threshold, extend_to)
+    }
+
+    /// Return the active subscription TTL policy.
+    pub fn get_subscription_ttl_config(env: Env) -> (u32, u32) {
+        subscription::ttl_config(&env)
     }
 
     /// Get the current admin address.
