@@ -8,7 +8,7 @@ use crate::types::{
     AcceptedToken, AdminConfigChangedEvent, AdminProposal, AdminProposalCancelledEvent,
     AdminProposalClaimedEvent, AdminProposalCreatedEvent, AdminRotatedEvent, BatchChargeResult,
     DataKey, Error, FeeTokenConfiguredEvent, PendingTreasuryChange, RecoveryEvent,
-    RecoveryInitiatorRole, RecoveryReason, SchemaMigrationSummary, Subscription,
+    RecoveryInitiatorRole, RecoveryReason, RecoveryResult, SchemaMigrationSummary, Subscription,
     TreasuryChangeExecutedEvent, TreasuryChangeQueuedEvent, BATCH_MAX_SIZE, MAX_PROTOCOL_FEE_BIPS,
     TOPIC_RECOVERY, SUB_TTL_EXTEND_TO, SUB_TTL_THRESHOLD,
 };
@@ -765,29 +765,12 @@ pub fn do_recover_stranded_funds(
     amount: i128,
     recovery_id: String,
     reason: RecoveryReason,
-) -> Result<(), Error> {
+) -> Result<RecoveryResult, Error> {
     require_admin_auth(env, &admin)?;
 
     if amount <= 0 {
         return Err(Error::InvalidRecoveryAmount);
     }
-
-    // Require multi-sig approval for fund recovery
-    // We use the amount truncated to u32 as a reasonable approximation
-    // for the proposal matching. For large amounts, consider splitting.
-    let amount_u32 = if amount > u32::MAX as i128 {
-        u32::MAX
-    } else {
-        amount as u32
-    };
-    
-    let proposal_id = require_multisig_approval(
-        env,
-        crate::types::ProposalKind::RecoverStrandedFunds,
-        &recipient,
-        Some(&token),
-        amount_u32,
-    )?;
 
     // Check for replay protection
     let recovery_key = DataKey::Recovery(recovery_id.clone());
@@ -795,17 +778,42 @@ pub fn do_recover_stranded_funds(
         return Err(Error::Replay);
     }
 
-    // Validate available recoverable balance
+    // Recover only unaccounted funds; prepaid balances and other liabilities
+    // remain reserved even when the requested amount is larger.
     let token_client = token::Client::new(env, &token);
     let contract_balance = token_client.balance(&env.current_contract_address());
     let accounted_balance = crate::accounting::get_total_accounted(env, &token);
 
     let recoverable = contract_balance
         .checked_sub(accounted_balance)
-        .ok_or(Error::Underflow)?;
-    if amount > recoverable {
-        return Err(Error::InsufficientBalance);
+        .ok_or(Error::Underflow)?
+        .max(0);
+    let recovered_amount = amount.min(recoverable);
+    let surplus_amount = amount - recovered_amount;
+
+    if recovered_amount == 0 {
+        env.storage().persistent().set(&recovery_key, &true);
+        return Ok(RecoveryResult {
+            recovered_amount,
+            surplus_amount,
+        });
     }
+
+    // Match guardian approval against the amount that will actually move.
+    // Amounts larger than u32::MAX use the existing saturated proposal key.
+    let amount_u32 = if recovered_amount > u32::MAX as i128 {
+        u32::MAX
+    } else {
+        recovered_amount as u32
+    };
+
+    let proposal_id = require_multisig_approval(
+        env,
+        crate::types::ProposalKind::RecoverStrandedFunds,
+        &recipient,
+        Some(&token),
+        amount_u32,
+    )?;
 
     // Mark recovery as executed
     env.storage().persistent().set(&recovery_key, &true);
@@ -817,7 +825,7 @@ pub fn do_recover_stranded_funds(
         admin: admin.clone(),
         recipient: recipient.clone(),
         token: token.clone(),
-        amount,
+        amount: recovered_amount,
         reason,
         timestamp: env.ledger().timestamp(),
         schema_version: crate::types::EVENT_SCHEMA_VERSION,
@@ -832,9 +840,12 @@ pub fn do_recover_stranded_funds(
     );
 
     // Actual token transfer logic
-    token_client.transfer(&env.current_contract_address(), &recipient, &amount);
+    token_client.transfer(&env.current_contract_address(), &recipient, &recovered_amount);
 
-    Ok(())
+    Ok(RecoveryResult {
+        recovered_amount,
+        surplus_amount,
+    })
 }
 
 // ── Protocol fee helpers ──────────────────────────────────────────────────────

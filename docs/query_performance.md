@@ -10,7 +10,7 @@ Storage reads are the primary driver of execution costs in Soroban. The followin
 |---|---|---|---|
 | `get_subscription` | O(1) | None | Direct persistent storage lookup. |
 | `get_subscriptions_by_merchant` | O(N) | `MAX_SUBSCRIPTION_LIST_PAGE` (100) | Reads full merchant index `Vec<u32>` + up to `limit` records. `reverse = true` (newest-first) has identical complexity: the index is walked from its end, never inverted. |
-| `list_subscriptions_by_merchant` | O(N) | `MAX_SUBSCRIPTION_LIST_PAGE` (100) | Cursor-based variant of the above with the same forward/reverse cost symmetry. |
+| `list_subscriptions_by_merchant` | O(N) | `MAX_SUBSCRIPTION_LIST_PAGE` (100) per call; `MAX_MERCHANT_CURSOR_DEPTH` (1,000) total | Cursor-based variant of the above with the same forward/reverse cost symmetry. Chained traversal stops after 1,000 index entries. |
 | `get_subscriptions_by_token` | O(N) | `MAX_SUBSCRIPTION_LIST_PAGE` (100) | Reads full token index `Vec<u32>` + up to `limit` records. |
 | `list_subscriptions_by_subscriber` | O(MAX_SCAN_DEPTH) | `MAX_SCAN_DEPTH` (1,000) | Performs a linear ID scan. Caps at 1,000 IDs per call. |
 | `get_cap_info` | O(1) | None | Single record read. |
@@ -111,6 +111,10 @@ This limit applies to **Write Path Checks** (e.g., Credit Limit enforcement, Pla
 ### `MAX_SUBSCRIPTION_LIST_PAGE` (100)
 Applies to index-based pagination (`get_subscriptions_by_merchant`, `get_subscriptions_by_token`).
 - **Behavior**: Requests for `limit > 100` are rejected to prevent excessive storage footprint in a single transaction.
+
+### `MAX_MERCHANT_CURSOR_DEPTH` (1,000)
+Applies to chained `list_subscriptions_by_merchant` cursor pagination.
+- **Behavior**: A page is truncated at offset 1,000 and returns no `next_cursor`. A request with a cursor at or beyond that offset returns an empty terminal page (a tombstone), preventing callers from using repeated pages to enumerate an unbounded merchant index.
 
 ## Best Practices for High-Volume Accounts
 

@@ -71,15 +71,15 @@ pub enum SubscriptionStatus {
 
 **Storage Operations**:
 - Create: `do_create_subscription()` → sets `DataKey::Sub(id)` key in persistent storage
-- Read: `get_subscription()` → reads `DataKey::Sub(id)` key from persistent storage and extends its TTL when it is near expiration
+- Read: `get_subscription()` and collection queries that load records → read `DataKey::Sub(id)` from persistent storage and extend its TTL when it is near expiration
 - Update: All lifecycle functions modify and re-set `DataKey::Sub(id)` key in persistent storage, then extend its TTL via `SUB_TTL_THRESHOLD` / `SUB_TTL_EXTEND_TO`
 - Delete: Not implemented (cancelled subscriptions remain in persistent storage)
 
-**TTL behavior:** Subscription entries are kept alive on every read and write. Billing statement secondary index entries and billing period snapshots also carry their own TTL thresholds (`BILLING_STATEMENT_TTL_THRESHOLD`, `BILLING_STATEMENT_TTL_EXTEND_TO`, `BILLING_PERIOD_SNAPSHOT_TTL_THRESHOLD`, `BILLING_PERIOD_SNAPSHOT_TTL_EXTEND_TO`) and are extended when the corresponding storage operations execute.
+**TTL behavior:** Subscription entries are kept alive on every record read and write. This includes single-subscription queries and list/reconciliation queries that load subscription records; the subscriber index query that returns only IDs does not load or refresh the corresponding records. Billing statement secondary index entries and billing period snapshots also carry their own TTL thresholds (`BILLING_STATEMENT_TTL_THRESHOLD`, `BILLING_STATEMENT_TTL_EXTEND_TO`, `BILLING_PERIOD_SNAPSHOT_TTL_THRESHOLD`, `BILLING_PERIOD_SNAPSHOT_TTL_EXTEND_TO`) and are extended when the corresponding storage operations execute.
 
 #### TTL exhaustion semantics
 
-A `DataKey::Sub(id)` entry is readable while `live_until_ledger >= current_ledger`. The contract refreshes this window on every `get_subscription`/`write_subscription` via `extend_ttl(SUB_TTL_THRESHOLD, SUB_TTL_EXTEND_TO)`, so an entry that is touched at least once per `SUB_TTL_EXTEND_TO` window (365 days) never expires.
+A `DataKey::Sub(id)` entry is readable while `live_until_ledger >= current_ledger`. The contract refreshes this window on every subscription-record read or write via `extend_ttl(SUB_TTL_THRESHOLD, SUB_TTL_EXTEND_TO)`, so an entry that is read or written at least once per `SUB_TTL_EXTEND_TO` window (365 days) never expires.
 
 If the window does lapse, the entry is **archived/expired by the host**, and the next access does **not** degrade gracefully to `Error::NotFound` (which would only surface for a key that was never written). Instead the Soroban host aborts with `Error(Storage, InternalError)`, surfaced to the SDK test harness as a panic. This is the safe outcome: an expired record can never be silently read back as live data. On-chain, accessing it would require a `RestoreFootprint` operation before the read.
 

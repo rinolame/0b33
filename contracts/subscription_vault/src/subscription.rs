@@ -190,6 +190,13 @@ pub(crate) fn extend_subscription_ttl(env: &Env, key: &DataKey) {
     maybe_extend_ttl(env, key, SUB_TTL_THRESHOLD, SUB_TTL_EXTEND_TO);
 }
 
+pub(crate) fn read_subscription(env: &Env, subscription_id: u32) -> Option<Subscription> {
+    let key = DataKey::Sub(subscription_id);
+    let sub = env.storage().persistent().get(&key)?;
+    extend_subscription_ttl(env, &key);
+    Some(sub)
+}
+
 pub(crate) fn write_subscription(env: &Env, subscription_id: u32, sub: &Subscription) {
     env.storage()
         .persistent()

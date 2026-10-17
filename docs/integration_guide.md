@@ -87,7 +87,7 @@ Key design properties:
 | `get_min_topup` | `() -> i128` | None | |
 | `get_admin` | `() -> Address` | None | |
 | `rotate_admin` | `(current_admin, new_admin) -> ()` | Admin | Emits `AdminRotatedEvent`. Existing subscriptions are unaffected. |
-| `recover_stranded_funds` | `(admin, recipient, amount, reason) -> ()` | Admin | `reason` is `RecoveryReason`: `AccidentalTransfer`=0, `DeprecatedFlow`=1, `UnreachableSubscriber`=2. |
+| `recover_stranded_funds` | `(admin, token, recipient, amount, recovery_id, reason) -> RecoveryResult` | Admin | Transfer is capped at the available unaccounted balance. `RecoveryResult` reports `recovered_amount` and any excess requested amount as `surplus_amount`. `reason` is `RecoveryReason`: `UserOverpayment`=0, `FailedTransfer`=1, `ExpiredEscrow`=2, `SystemCorrection`=3, `AccidentalTransfer`=4. |
 | `set_oracle_config` | `(admin, enabled, oracle, max_age_seconds) -> ()` | Admin | When enabled, subscription `amount` is interpreted as quote-currency and converted via oracle price. |
 | `get_oracle_config` | `() -> OracleConfig` | None | |
 | `set_billing_retention` | `(admin, keep_recent) -> ()` | Admin | Configures how many detailed statement rows are retained per subscription. |

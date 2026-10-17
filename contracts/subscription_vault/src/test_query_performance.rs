@@ -1,7 +1,10 @@
 #![cfg(test)]
 
 use crate::{
-    queries::{MAX_QUERY_RESULTS, MAX_SCAN_DEPTH, MAX_SUBSCRIPTION_LIST_PAGE},
+    queries::{
+        MAX_MERCHANT_CURSOR_DEPTH, MAX_QUERY_RESULTS, MAX_SCAN_DEPTH,
+        MAX_SUBSCRIPTION_LIST_PAGE,
+    },
     subscription::MAX_WRITE_PATH_SCAN_DEPTH,
     types::{Subscription, SubscriptionStatus},
     SubscriptionVault, SubscriptionVaultClient,
@@ -260,6 +263,45 @@ fn test_subscriber_list_empty() {
     let page = client.list_subscriptions_by_subscriber(&subscriber, &0, &100);
     assert_eq!(page.subscription_ids.len(), 0);
     assert_eq!(page.next_start_id, None);
+}
+
+#[test]
+fn test_merchant_cursor_depth_is_bounded_and_exhausts_with_tombstone() {
+    let (env, client, token, _) = setup();
+    let subscriber = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let total = MAX_MERCHANT_CURSOR_DEPTH + 10;
+    inject_subscriptions(&env, &client.address, total, &subscriber, &token);
+
+    env.as_contract(&client.address, || {
+        let mut ids = soroban_sdk::Vec::new(&env);
+        for id in 0..total {
+            ids.push_back(id);
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::MerchantSubs(merchant.clone()), &ids);
+    });
+
+    let last_page = client.list_subscriptions_by_merchant(
+        &merchant,
+        &Some(MAX_MERCHANT_CURSOR_DEPTH - 50),
+        &100,
+        &false,
+    );
+    assert_eq!(last_page.subscriptions.len(), 50);
+    assert_eq!(last_page.total, total);
+    assert_eq!(last_page.next_cursor, None);
+
+    let tombstone = client.list_subscriptions_by_merchant(
+        &merchant,
+        &Some(MAX_MERCHANT_CURSOR_DEPTH),
+        &100,
+        &false,
+    );
+    assert_eq!(tombstone.subscriptions.len(), 0);
+    assert_eq!(tombstone.total, total);
+    assert_eq!(tombstone.next_cursor, None);
 }
 
 #[test]

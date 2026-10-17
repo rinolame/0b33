@@ -1549,6 +1549,16 @@ pub struct BatchWithdrawResult {
 }
 
 #[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RecoveryResult {
+    /// Amount transferred, capped at the token's unaccounted recoverable balance.
+    pub recovered_amount: i128,
+    /// Requested amount that could not be transferred because it exceeded the
+    /// recoverable balance.
+    pub surplus_amount: i128,
+}
+
+#[contracttype]
 #[derive(Clone, Debug)]
 pub struct ContractSnapshot {
     pub admin: Address,
