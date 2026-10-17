@@ -181,9 +181,37 @@ pub fn get_plan_template(env: &Env, plan_template_id: u32) -> Result<PlanTemplat
 /// Delegates to `Persistent::extend_ttl` which internally only extends when
 /// the remaining TTL is below the threshold.
 pub(crate) fn maybe_extend_ttl(env: &Env, key: &DataKey, threshold: u32, extend_to: u32) {
+    let _ = (threshold, extend_to);
+    let (configured_threshold, configured_extend_to) = ttl_config(env);
     env.storage()
         .persistent()
-        .extend_ttl(key, threshold, extend_to);
+        .extend_ttl(key, configured_threshold, configured_extend_to);
+}
+
+const TTL_THRESHOLD_KEY: &str = "subscription_ttl_threshold";
+const TTL_EXTEND_TO_KEY: &str = "subscription_ttl_extend_to";
+
+pub(crate) fn ttl_config(env: &Env) -> (u32, u32) {
+    let threshold = env.storage().instance().get(&Symbol::new(env, TTL_THRESHOLD_KEY))
+        .unwrap_or(SUB_TTL_THRESHOLD);
+    let extend_to = env.storage().instance().get(&Symbol::new(env, TTL_EXTEND_TO_KEY))
+        .unwrap_or(SUB_TTL_EXTEND_TO);
+    (threshold, extend_to)
+}
+
+pub(crate) fn set_ttl_config(
+    env: &Env,
+    admin: Address,
+    threshold: u32,
+    extend_to: u32,
+) -> Result<(), Error> {
+    crate::admin::require_admin_auth(env, &admin)?;
+    if threshold == 0 || extend_to < threshold {
+        return Err(Error::InvalidInput);
+    }
+    env.storage().instance().set(&Symbol::new(env, TTL_THRESHOLD_KEY), &threshold);
+    env.storage().instance().set(&Symbol::new(env, TTL_EXTEND_TO_KEY), &extend_to);
+    Ok(())
 }
 
 pub(crate) fn extend_subscription_ttl(env: &Env, key: &DataKey) {
